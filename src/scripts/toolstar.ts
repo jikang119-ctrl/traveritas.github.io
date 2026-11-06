@@ -9,9 +9,10 @@
    · 设置：分类一圈，点一类在再外一圈摆出它的项（与标签 / 年月一样，外圈跟着里圈最长的字往外让）。
    · 声音：三圈音量弧（环境声 / Ave / 音效），图标在每圈最下面，点它开关；拖弧、滚轮、方向键调音量。
    · 寻找：标签与年月都是检索框里的一个词（漫游空间的检索要求每个词都命中），点一下加上，再点去掉。
-   · 帧循环只在有东西在动时运转：开合、转圈、梦面里星的自转（梦面自转降到约 24fps）。
+   · 帧循环只在有东西在动时运转：开合、转圈时逐帧；只剩梦面里星的自转时降到约 15fps（见「帧循环」）。
    ───────────────────────────────────────────────────────────── */
 
+import { SLOT, slotWait } from './frame-slot';
 import { clamp, reducedMotion } from './lib';
 import { flipFrom, onRealityChange, type Reality } from './reality';
 import { getLevel, isLive, isSounding, onLevels, rememberLevel, setLevel, toggleLevel, type Channel } from './sound';
@@ -63,6 +64,8 @@ class Ring {
   gapAfter: number;
   /** 条目从轨道往外伸出的最长距离（放射的字有多长；显形时量） */
   extent = 20;
+  /** 复制件上一次跟着原件换字的时刻：原件走神换字（约 30fps）期间帧循环保持逐帧，复制件不掉拍 */
+  syncAt = -Infinity;
 
   constructor(el: HTMLElement, R: number, step: number, start?: number, gapAfter = -1) {
     this.gapAfter = gapAfter;
@@ -123,7 +126,7 @@ class Ring {
   }
 
   /** 推进一帧；返回是否还在动 */
-  frame(rm: boolean): boolean {
+  frame(rm: boolean, now: number): boolean {
     const k = rm ? 1 : 0.16;
     this.offset += (this.target - this.offset) * k;
     this.alpha += (this.alphaTo - this.alpha) * (rm ? 1 : 0.18);
@@ -144,14 +147,17 @@ class Ring {
         s.setProperty('--ts-a', a.toFixed(2)); // 名字与外侧小刻沿这个角度往外
       }
       if (it.src) {
-        if (it.el.textContent !== it.src.textContent) it.el.innerHTML = it.src.innerHTML;
+        if (it.el.textContent !== it.src.textContent) {
+          it.el.innerHTML = it.src.innerHTML;
+          this.syncAt = now;
+        }
         for (const attr of ['aria-pressed', 'aria-current']) {
           const v = it.src.getAttribute(attr);
           if (v !== it.el.getAttribute(attr)) v == null ? it.el.removeAttribute(attr) : it.el.setAttribute(attr, v);
         }
       }
     }
-    return this.offset !== this.target || this.alpha !== this.alphaTo;
+    return this.offset !== this.target || this.alpha !== this.alphaTo || now - this.syncAt < 100;
   }
 
   show(rm: boolean) {
@@ -240,8 +246,40 @@ export function initToolstar() {
   let tool: Tool | null = null;
   let reality: Reality = 'wake';
 
-  /* ── 星：±x ±y ±z 六支，正等轴视角（yaw 45°、pitch 35.264°）投影 ── */
+  /* ── 星：±x ±y ±z 六支，正等轴视角（yaw 45°、pitch 35.264°）投影 ──
+     六支与星心只建一次，之后只改变了的 d / fill-opacity。原先每帧 innerHTML 整个重建，
+     星底下那片 backdrop-filter 玻璃跟着每次重建重新合成。
+     按远近排好的第 i 支写进第 i 个节点，节点次序即画序；几乎正对视线、缩成一点的那支藏起来（排在末尾）。 */
   const ST = { auto: 0, spin: 0, spinTo: 0, wob: 0 };
+  const spikeEls = Array.from({ length: 6 }, () => {
+    const p = document.createElementNS(SVGNS, 'path');
+    p.setAttribute('fill', 'currentColor');
+    p.setAttribute('display', 'none');
+    return p;
+  });
+  const hub = document.createElementNS(SVGNS, 'circle');
+  hub.setAttribute('class', 'ts-hub');
+  hub.setAttribute('r', '1.7');
+  starG.replaceChildren(...spikeEls, hub);
+  /** 每个节点上一次写进去的值（d 为空＝藏着） */
+  const spikeWas = spikeEls.map(() => ({ d: '', op: '' }));
+  function putSpike(i: number, d: string, op: string) {
+    const el = spikeEls[i];
+    const was = spikeWas[i];
+    if (d !== was.d) {
+      if (!d) el.setAttribute('display', 'none');
+      else {
+        if (!was.d) el.removeAttribute('display');
+        el.setAttribute('d', d);
+      }
+      was.d = d;
+    }
+    if (d && op !== was.op) {
+      el.setAttribute('fill-opacity', op);
+      was.op = op;
+    }
+  }
+  /** 画一帧星；返回星自己是否还在过渡（翻 90° / 回正）。梦面的慢自转不算在内，由帧循环按慢拍接着 */
   function drawStar(dt: number, now: number) {
     const dream = reality === 'dream' && !RM;
     if (dream) ST.auto += dt * 12;
@@ -272,7 +310,7 @@ export function initToolstar() {
       }
     }
     spikes.sort((a, b) => a.z - b.z);
-    let out = '';
+    let n = 0;
     for (const p of spikes) {
       const L = Math.hypot(p.x, p.y);
       if (L < 0.6) continue;
@@ -280,31 +318,49 @@ export function initToolstar() {
       const uy = p.y / L;
       const w = 1.9;
       const op = (0.38 + (0.5 * (p.z + 1)) / 2).toFixed(3);
-      out += `<path d="M${(-uy * w).toFixed(2)} ${(ux * w).toFixed(2)}L${p.x.toFixed(2)} ${p.y.toFixed(2)}L${(uy * w).toFixed(2)} ${(-ux * w).toFixed(2)}L${(-ux * 1.4).toFixed(2)} ${(-uy * 1.4).toFixed(2)}Z" fill="currentColor" fill-opacity="${op}"/>`;
+      putSpike(
+        n++,
+        `M${(-uy * w).toFixed(2)} ${(ux * w).toFixed(2)}L${p.x.toFixed(2)} ${p.y.toFixed(2)}L${(uy * w).toFixed(2)} ${(-ux * w).toFixed(2)}L${(-ux * 1.4).toFixed(2)} ${(-uy * 1.4).toFixed(2)}Z`,
+        op,
+      );
     }
-    out += '<circle class="ts-hub" r="1.7"/>';
-    starG.innerHTML = out;
-    return dream || Math.abs(ST.spinTo - ST.spin) > 0.05 || Math.abs(Math.round(ST.auto / 90) * 90 - ST.auto) > 0.05;
+    while (n < spikeEls.length) putSpike(n++, '', '');
+    return Math.abs(ST.spinTo - ST.spin) > 0.05 || (!dream && Math.abs(Math.round(ST.auto / 90) * 90 - ST.auto) > 0.05);
   }
 
-  /* ── 帧循环 ── */
+  /* ── 帧循环 ──
+     有东西在过渡（开合、转圈、星翻 90° / 回正、复制件跟着原件换字）时逐帧跑；
+     只剩梦面里星的慢自转时降到约 15fps：先等到共同出帧时隙（frame-slot.ts，两个 30fps 时隙一拍）再请求 rAF。
+     原先梦面里每个 vsync 都请求 rAF、星按时间差隔帧才画 —— 正是 lib.ts 帧钟说明里不要的那种写法。
+     对齐时隙让星与脑电 Worker 的画布落在同一组 vsync 上，不单独多出合成帧。
+     自转按时间走（12°/s），降帧不改转速。标签页隐藏即停，回来再起。 */
+  const IDLE_MS = 2 * SLOT;
   let raf = 0;
+  let timer = 0;
   let lastStar = performance.now();
   // 歇过之后重新起跑：第一帧按一帧算。否则歇着的那段时间整个记成 dt（封顶 0.1s），
   // 一按下去星头一帧就跳过大半个 90°，看上去是抖一下而不是转过去
   let fresh = true;
   function kick() {
-    if (!raf) {
-      fresh = true;
-      raf = requestAnimationFrame(loop);
-    }
+    if (raf || document.hidden) return;
+    if (timer) {
+      // 正在等慢拍：提前到下一帧。星没歇过，dt 照实算
+      clearTimeout(timer);
+      timer = 0;
+    } else fresh = true;
+    raf = requestAnimationFrame(loop);
+  }
+  function halt() {
+    clearTimeout(timer);
+    cancelAnimationFrame(raf);
+    timer = raf = 0;
   }
   function loop(now: number) {
     raf = 0;
     let busy = false;
-    for (const r of Object.values(rings)) if (!r.el.hidden) busy = r.frame(RM) || busy;
+    for (const r of Object.values(rings)) if (!r.el.hidden) busy = r.frame(RM, now) || busy;
     if (!volBox.hidden) busy = frameVols(RM) || busy;
-    // 星：开合 / 回正时每帧画；梦面里只是慢慢自转，降到约 24fps
+    // 星：醒面与翻转时每帧画；梦面里别的东西在动时，星仍按约 24fps 跟
     const dream = reality === 'dream' && !RM;
     if (Math.abs(ST.spinTo - ST.spin) > 0.05 || !dream || now - lastStar > 41) {
       const dt = fresh ? 1 / 60 : Math.min(0.1, Math.max(0, (now - lastStar) / 1000));
@@ -312,10 +368,15 @@ export function initToolstar() {
       busy = drawStar(dt, now) || busy;
       lastStar = now;
     }
-    if (dream) busy = true;
-    if (busy && !document.hidden) raf = requestAnimationFrame(loop);
+    if (document.hidden) return;
+    if (busy) raf = requestAnimationFrame(loop);
+    else if (dream)
+      timer = window.setTimeout(() => {
+        timer = 0;
+        raf = requestAnimationFrame(loop);
+      }, slotWait(IDLE_MS));
   }
-  document.addEventListener('visibilitychange', () => !document.hidden && kick());
+  document.addEventListener('visibilitychange', () => (document.hidden ? halt() : kick()));
 
   /* ── 轨道与底色 ── */
   function place() {
