@@ -36,6 +36,7 @@ import { createInk } from './ink.js';
 import { createInverse } from './inverse';
 import { onRealityChange, setRingRenderer } from '../reality';
 import { setEegSpine } from '../eeg-spine';
+import { SLOT, slotWait } from '../frame-slot';
 import { BRAND_WORDS } from '../brand';
 
 const PATH = { essay: '/articles/', moment: '/moments/', project: '/projects/' };
@@ -81,8 +82,11 @@ export async function initWander(host) {
      现在它挪到最后：先让窗落位、灯稍后亮。light 在两处使用都是 `if (light)` 保护的，
      未就绪时 #w-light 退回 CSS 渐变（wander.css 本来就备了这一手）。
      例外是主页：大字是流光的「反相窗」（inverse.js），窗得在入场动画之前建好，
-     否则字会先以墨色出现、等光编译完才翻成窗。主页没有要赶首屏的卡，光就在下面直接起。 */
+     否则字会先以墨色出现、等光编译完才翻成窗。主页没有要赶首屏的卡，光就在下面直接起。
+     （2026-11 起 createLight 是异步的：有 KHR_parallel_shader_compile 时编译不占主线程，
+     light 在编好那一刻才赋值；主页的幕由 GrainBoot 轮询 lightReady 盖到那时。） */
   let light = null;
+  let lightPending = false;
   /* 开屏期由 GrainBoot 写：{ cellPx, lv, dither }（屏幕 px）与脑电线 reveal 0–1。
      开屏结束后都退回 null，交给日常渲染。 */
   let bootGrain = null;
@@ -90,8 +94,12 @@ export async function initWander(host) {
   /* 开屏期脑电群的显隐：首帧就藏住（不等 GrainBoot 起来），随 setReveal 亮起 */
   let bootLineOpacity = document.documentElement.hasAttribute('data-grain-boot') ? 0 : null;
   const startLight = () => {
-    if (light) return;
-    try { light = createLight(host.querySelector('#w-light'), PX, { wind: true }); } catch { /* 没有 WebGL2：退回 CSS 渐变 */ }
+    if (light || lightPending) return;
+    lightPending = true;
+    createLight(host.querySelector('#w-light'), PX, { wind: true }).then(
+      (l) => { light = l; },
+      () => { /* 着色器编不过：退回 CSS 渐变 */ },
+    );
   };
   if (host.dataset.scene === 'home') startLight();
 
@@ -1046,12 +1054,39 @@ export async function initWander(host) {
   const hotClock = [0, 0, 0];
   const bias = [0, 0, 0];
   let homeHot = -1;
+  /* ── 出帧分档 ──
+     有东西在动（输入后 1.5s 内、镜头 / 窗在飞、过渡未完、开屏、滚动与弹簧未停、悬停的池子与换面在走）→ 每个 vsync 一帧；
+     静置 → 约 30fps，对齐全站共同时隙（frame-slot.ts，与脑电 worker 同拍提交）；阅读窗开着、底下静置 → 约 15fps。
+     静置时还在动的只有流光、天气与主页镜头的慢推，30fps 看不出差别；任何输入立刻踢回满帧。 */
+  let lastInput = -1e9;
+  let idleTimer = 0;
+  const kick = () => {
+    lastInput = performance.now();
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = 0;
+      requestAnimationFrame(tick);
+    }
+  };
+  for (const ev of ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'keydown', 'touchstart', 'touchmove'])
+    addEventListener(ev, kick, { passive: true, capture: true });
+  function lively(t) {
+    if (performance.now() - lastInput < 1500) return true;
+    if (camFly || drag || flights.size || t < busy || t < clipOn || bootGrain || bootReveal != null) return true;
+    if (vel.x || vel.y || pend.x || pend.y || pull > 0.001) return true;
+    if (Math.abs(faceTo - face) > 0.002 || Math.abs(readGoal - readFx) > 0.002) return true;
+    for (const h of hotClock) if (h > 0 && h < 1) return true;
+    for (const sc of scroll) if (sc.vel || Math.abs(sc.target - sc.pos) > 0.5) return true;
+    return false;
+  }
   function tick(ts) {
-    const dt = Math.min(0.05, ((ts - clock.last) * clock.speed) / 1000);
+    idleTimer = 0;
+    const dt = Math.min(0.08, ((ts - clock.last) * clock.speed) / 1000);
     clock.t += (ts - clock.last) * clock.speed;
     clock.last = ts;
     if (clock.speed) step(clock.t, dt);
-    requestAnimationFrame(tick);
+    if (lively(clock.t)) requestAnimationFrame(tick);
+    else idleTimer = setTimeout(() => { idleTimer = 0; requestAnimationFrame(tick); }, slotWait(reading ? SLOT * 2 : SLOT));
   }
   /* 漫游里往后退得够快（zT 减小的速度）就收回检索；慢慢往后推拉只是推拉。
      速度 = zT 每帧增量 / dt 的指数平滑（τ 0.25s：滚轮一格一格的跳变被抹平，要连着快退约四分之一秒才算数）；
@@ -1158,6 +1193,7 @@ export async function initWander(host) {
     if (light) light.draw({ t: lightT, pan, zoom: cam.z, mouse, dim: dimE, seam: seamGeom(), split, bias, lift, ring: ringOn ? ring : null, face, grain: bootGrain });
     makeWin();
     if (win) win.step();
+    makeInk();
     if (ink) ink.step(frame);
     const regions = {};
     const show = {};
@@ -1834,8 +1870,13 @@ export async function initWander(host) {
   addEventListener('xm-multi', () => { Faces.repaintMulti(ALL); });
 
   /* ══ 字随底换墨（ink.js）：浮在流光上的字按底下的明暗换墨。没有 WebGL（流光退回 CSS 渐变）时不接，字用原来的颜色 ══ */
-  const ink = light ? createInk(host.querySelector('#w-light')) : null;
-  if (ink) {
+  /* 光是异步编好的，换墨跟反相窗一样留一个「等光就绪再接」的口子，由渲染循环每帧问一次。
+     只在主页场景接：光原先只在主页是同步起的，目录页进来时这里拿不到光、一直不接——保持原样。 */
+  let ink = null;
+  const inkHere = host.dataset.scene === 'home';
+  const makeInk = () => {
+    if (ink || !light || !inkHere) return;
+    ink = createInk(host.querySelector('#w-light'));
     const q = (sel) => host.querySelector(sel);
     const AMBER = { light: [189, 176, 217], dark: [79, 74, 102] };
     ink.add(q('.w-home-kicker span'), { a: 0.72 });
@@ -1850,7 +1891,8 @@ export async function initWander(host) {
       ink.add(el.querySelector('i'), { a: 0.6 });
       ink.add(el.querySelector('.ct'), AMBER);
     }
-  }
+  };
+  makeInk();
 
   /* ══ 反相窗（inverse.js）：主页大字不换墨，它是那片流光的一扇窗——
      底下那一小块流光反相、保住色相，按字形遮罩。同样要有 WebGL 才接；
@@ -1904,8 +1946,8 @@ export async function initWander(host) {
   root.classList.add('w-ready');
   requestAnimationFrame(tick);
 
-  /* 窗已经在落位了，现在才去编译那套 WebGL 着色器（≈0.9s 的主线程块）。
-     等两跳：入场的第一帧先排出去，免得又把它挤在卡片出现之前。 */
+  /* 窗已经在落位了，现在才去编译那套 WebGL 着色器。并行编译时不占主线程；
+     没有并行编译扩展的浏览器上仍是一整块同步编译，所以照旧等两跳：入场的第一帧先排出去。 */
   if (typeof requestIdleCallback === 'function') requestIdleCallback(startLight, { timeout: 1500 });
   else setTimeout(startLight, 600);
 

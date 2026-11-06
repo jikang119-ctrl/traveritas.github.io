@@ -190,8 +190,31 @@ export function initMist(): () => void {
   const ctx = hardwareContext(el);
   if (!ctx) return () => {}; // 静态雾留在 CSS 上
 
-  const program = link(ctx, VERT, FRAG);
-  if (!program) return () => {};
+  /* 编译不在原地等：Windows 上（ANGLE → D3D11）这套着色器要编约 0.8s，同步等会把整页脚本的
+     初始化都压在后面。有 KHR_parallel_shader_compile 就每帧问一次编好没有，编好再接场；
+     这之前露着的是 CSS 静态雾。没有这个扩展就退回原来的同步路径。 */
+  const pending = startLink(ctx, VERT, FRAG);
+  if (!pending) return () => {};
+  const par = ctx.getExtension('KHR_parallel_shader_compile');
+  let releaseField: (() => void) | null = null;
+  let cancelled = false;
+  const wait = () => {
+    if (cancelled || ctx.isContextLost()) return;
+    if (par && !ctx.getProgramParameter(pending, par.COMPLETION_STATUS_KHR)) {
+      requestAnimationFrame(wait);
+      return;
+    }
+    const program = finishLink(ctx, pending);
+    if (program) releaseField = runField(el, ctx, program);
+  };
+  wait();
+  return () => {
+    cancelled = true;
+    releaseField?.();
+  };
+}
+
+function runField(el: HTMLCanvasElement, ctx: WebGL2RenderingContext, program: WebGLProgram): () => void {
   ctx.useProgram(program);
 
   const buffer = ctx.createBuffer();
@@ -359,17 +382,13 @@ function hardwareContext(canvas: HTMLCanvasElement): WebGL2RenderingContext | nu
   return gl;
 }
 
-function link(gl: WebGL2RenderingContext, vert: string, frag: string): WebGLProgram | null {
+/* 只提交编译与链接，不查状态（查 COMPILE_STATUS / LINK_STATUS 会原地等编译完） */
+function startLink(gl: WebGL2RenderingContext, vert: string, frag: string): WebGLProgram | null {
   const compile = (type: number, src: string) => {
     const sh = gl.createShader(type);
     if (!sh) return null;
     gl.shaderSource(sh, src);
     gl.compileShader(sh);
-    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-      console.warn('[mist] shader: ' + gl.getShaderInfoLog(sh));
-      gl.deleteShader(sh);
-      return null;
-    }
     return sh;
   };
   const vs = compile(gl.VERTEX_SHADER, vert);
@@ -380,12 +399,20 @@ function link(gl: WebGL2RenderingContext, vert: string, frag: string): WebGLProg
   gl.attachShader(program, vs);
   gl.attachShader(program, fs);
   gl.linkProgram(program);
-  gl.deleteShader(vs);
-  gl.deleteShader(fs);
+  return program;
+}
+
+/* 编完之后才查：编不过就打出日志、退回静态雾 */
+function finishLink(gl: WebGL2RenderingContext, program: WebGLProgram): WebGLProgram | null {
+  const shaders = gl.getAttachedShaders(program) ?? [];
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    for (const sh of shaders)
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) console.warn('[mist] shader: ' + gl.getShaderInfoLog(sh));
     console.warn('[mist] link: ' + gl.getProgramInfoLog(program));
+    for (const sh of shaders) gl.deleteShader(sh);
     gl.deleteProgram(program);
     return null;
   }
+  for (const sh of shaders) gl.deleteShader(sh);
   return program;
 }

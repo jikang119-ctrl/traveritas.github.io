@@ -59,6 +59,7 @@ uniform float uCell;    // 开屏颗粒：一格几画布 px（1 = 首页原样�
 uniform float uLv;      // 开屏期的量化阶（首页 26）
 uniform float uDither;  // 开屏期的抖动强度 0–1
 uniform float uGrainOn; // 0 = 常规（分区阶数），1 = 用 uCell/uLv/uDither
+uniform int uOct;       // fbm 的阶数，恒为 4（见 fbm）
 out vec4 o;
 
 float h21(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
@@ -67,10 +68,12 @@ float vnoise(vec2 p){
   vec2 u = f * f * (3.0 - 2.0 * f);
   return mix(mix(h21(i), h21(i + vec2(1, 0)), u.x), mix(h21(i + vec2(0, 1)), h21(i + vec2(1, 1)), u.x), u.y);
 }
+/* 阶数走 uniform（恒为 4）而不写死：写死时编译器把循环展开、再把整串 fbm 全内联，
+   Windows（ANGLE → D3D11）上整套着色器光编译就要 2s 以上；循环留着只要 0.7s 左右，结果一样。 */
 float fbm(vec2 p){
   float a = 0.5, s = 0.0;
   mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
-  for (int i = 0; i < 4; i++){ s += a * vnoise(p); p = r * p * 2.03 + 11.7; a *= 0.5; }
+  for (int i = 0; i < uOct; i++){ s += a * vnoise(p); p = r * p * 2.03 + 11.7; a *= 0.5; }
   return s;
 }
 float field(vec2 p, float t){
@@ -186,31 +189,27 @@ vec3 shadeAt(vec2 fcS, out vec3 grOut){
   return col;
 }
 
+/* 开屏颗粒与日常两条路只在「取哪一点」上不同：先各自算出采样点，再在唯一一处调 shadeAt()。
+   shadeAt 展开后很大，两处调用会被编译器各内联一份；Windows 上（ANGLE → D3D11）这样一份程序
+   要编 8–15s，收成一处后约 2s。改的只是结构，逐像素输出不变。 */
 void main(){
   vec2 fc0 = gl_FragCoord.xy;
   vec2 ys0 = vec2(fc0.x, uRes.y - fc0.y);
+  bool grain = uGrainOn > 0.5;
+  float L = 0.0;
+  vec2 fc = fc0;
 
-  /* ── 开屏颗粒：格宽从「比视口还大」收到 1 画布 px ──
-     每个像素只取它所在块的中心（块超过视口时取视口中心）——一个块只有一个颜色，
-     和真正的低分辨率画布等价，成本与日常渲染同一量级。
-     日常（uGrainOn=0）走下面的原路径，逐像素不变。 */
-  if (uGrainOn > 0.5) {
+  if (grain) {
+    /* ── 开屏颗粒：格宽从「比视口还大」收到 1 画布 px ──
+       每个像素只取它所在块的中心（块超过视口时取视口中心）——一个块只有一个颜色，
+       和真正的低分辨率画布等价，成本与日常渲染同一量级。 */
     float cell = max(uCell, 1.0);
     vec2 b0 = floor(ys0 / cell) * cell;
     vec2 b1 = min(b0 + vec2(cell), uRes);
     vec2 center = (max(b0, vec2(0.0)) + b1) * 0.5;
-    vec3 gr;
-    vec3 col = shadeAt(vec2(center.x, uRes.y - center.y), gr);
-    float Lq = max(uLv, 1.0);
-    col = floor(col * Lq + 0.5 + (bayer(fc0) - 0.5) * gr.x * uDither) / Lq;
-    o = vec4(clamp(col, 0.0, 1.0), 1.0);
-    return;
-  }
-
-  // 塌缩圈：按 8×8 的块取级别，级别越高采样格越粗（1 / 2 / 4 / 8 画布 px）
-  float L = 0.0;
-  vec2 fc = fc0;
-  if (uRing.z > 0.0) {
+    fc = vec2(center.x, uRes.y - center.y);
+  } else if (uRing.z > 0.0) {
+    // 塌缩圈：按 8×8 的块取级别，级别越高采样格越粗（1 / 2 / 4 / 8 画布 px）
     vec2 blk = floor(ys0 / 8.0);
     float d = length((blk + 0.5) * 8.0 - uRing.xy);
     L = clamp(floor(min((uRing.z - d) / uRingStep, 4.0) + bayer(blk) - uRing.w), 0.0, 4.0);
@@ -220,47 +219,54 @@ void main(){
       fc = vec2(cell.x, uRes.y - cell.y);
     }
   }
-  vec2 ys = vec2(fc.x, uRes.y - fc.y);
 
-  // 分区：这一格落在缝「后一侧」的比例，缝上那一格按覆盖量混两边
-  float k1 = clamp(dot(ys - uSeamP.xy, uSeamN) + 0.5, 0.0, 1.0);
-  float k2 = clamp(dot(ys - uSeamP.zw, uSeamN) + 0.5, 0.0, 1.0);
-  vec4 w = vec4(1.0 - k1, max(0.0, k1 - k2), k2, 0.0);
-  if (uSplit < 0.999) w = mix(poolW(fc), w, uSplit);
-
-  float vp = flowV(fc, false);
-  vec3 col = vec3(0.0);
-  vec3 gr = vec3(0.0);
-  if (w.x > 0.0) { col += w.x * colorize(0, uWind > 0.0 ? flowV(fc, true) : vp, fc); gr += w.x * uG[0]; }
-  if (w.y > 0.0) { col += w.y * colorize(1, vp, fc); gr += w.y * uG[1]; }
-  if (w.z > 0.0) { col += w.z * colorize(2, vp, fc); gr += w.z * uG[2]; }
-  if (w.w > 0.0) { col += w.w * colorize(3, vp, fc); gr += w.w * uG[3]; }
-  col *= 1.0 - uDim * 0.42;
+  vec3 gr;
+  vec3 col = shadeAt(fc, gr);
   col *= 1.0 - 0.055 * L;
 
-  float Lq = gr.z;
-  col = floor(col * Lq + 0.5 + (bayer(fc0) - 0.5) * gr.x) / Lq;
+  float Lq = grain ? max(uLv, 1.0) : gr.z;
+  float dz = grain ? gr.x * uDither : gr.x;
+  col = floor(col * Lq + 0.5 + (bayer(fc0) - 0.5) * dz) / Lq;
   o = vec4(clamp(col, 0.0, 1.0), 1.0);
 }`;
 
+/* 返回 Promise：编好后给出 { resize, draw, ORDER }；没有 WebGL2 给 null；着色器编不过则 reject */
 export function createLight(canvas, PX, { wind = true } = {}) {
   const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: true });
   if (!gl) {
     canvas.classList.add('no-gl');
-    return null;
+    return Promise.resolve(null);
   }
+  /* 编译不查状态、不取 uniform 位置：这两样都会让主线程原地等编译完。
+     有 KHR_parallel_shader_compile 时每帧问一次 COMPLETION_STATUS_KHR（不阻塞），编完再往下接；
+     没有这个扩展就退回原来的同步路径。 */
   const sh = (type, src) => {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
     return s;
   };
+  const vs = sh(gl.VERTEX_SHADER, VERT);
+  const fs = sh(gl.FRAGMENT_SHADER, FRAG);
   const prog = gl.createProgram();
-  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
-  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
   gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  const par = gl.getExtension('KHR_parallel_shader_compile');
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (gl.isContextLost()) return resolve(null);
+      if (par && !gl.getProgramParameter(prog, par.COMPLETION_STATUS_KHR)) return void requestAnimationFrame(poll);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        return reject(new Error(gl.getShaderInfoLog(fs) || gl.getShaderInfoLog(vs) || gl.getProgramInfoLog(prog)));
+      }
+      resolve(setup(gl, prog, canvas, PX, wind));
+    };
+    poll();
+  });
+}
+
+function setup(gl, prog, canvas, PX, wind) {
   gl.useProgram(prog);
   const buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -270,7 +276,8 @@ export function createLight(canvas, PX, { wind = true } = {}) {
   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
   const U = (n) => gl.getUniformLocation(prog, n);
   const u = {};
-  for (const n of ['uRes', 'uTime', 'uPan', 'uZoom', 'uMouse', 'uDim', 'uSeamP', 'uSeamN', 'uTan', 'uWind', 'uSplit', 'uBias', 'uRing', 'uRingStep', 'uP', 'uG', 'uLift', 'uCell', 'uLv', 'uDither', 'uGrainOn']) u[n] = U(n);
+  for (const n of ['uRes', 'uTime', 'uPan', 'uZoom', 'uMouse', 'uDim', 'uSeamP', 'uSeamN', 'uTan', 'uWind', 'uSplit', 'uBias', 'uRing', 'uRingStep', 'uP', 'uG', 'uLift', 'uCell', 'uLv', 'uDither', 'uGrainOn', 'uOct']) u[n] = U(n);
+  gl.uniform1i(u.uOct, 4);
 
   const flat = (set) => ORDER.flatMap((s) => set[s].flat());
   const PD = flat(DREAM);
