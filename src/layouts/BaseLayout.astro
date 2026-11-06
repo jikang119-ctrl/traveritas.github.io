@@ -6,6 +6,7 @@ import '../styles/global.css';
    写 400 的正文会匹配到 500；不要再写 300 / 700 / 900，写了也只会落到这两档。 */
 import '@fontsource/ibm-plex-mono/400.css';
 import '@fontsource/silkscreen/400.css';
+import { readFileSync } from 'node:fs';
 import SiteHeader from '../components/SiteHeader.astro';
 import SiteFooter from '../components/SiteFooter.astro';
 import Seam from '../components/chrome/Seam.astro';
@@ -66,6 +67,8 @@ interface Props {
   ave?: boolean;
   /* 本页是哪一篇条目（<集合>/<条目 id>）：Ave 只说它 frontmatter 里自带的那句（见 src/lib/ave-page.ts） */
   aveEntry?: string;
+  /* 首屏要预载哪几档宋体核心包。默认 500 + 600；首屏用不上的页给少一点（门页一档也不用） */
+  fontPreload?: ('500' | '600')[];
 }
 
 const {
@@ -90,6 +93,7 @@ const {
   bare = false,
   ave = !bare,
   aveEntry,
+  fontPreload = ['500', '600'],
 } = Astro.props;
 
 // 醒/梦双态标题推导规则（符合 AGENTS.md 核心词汇映射）
@@ -110,6 +114,19 @@ const deriveDreamTitle = (wake: string): string => {
 const resolvedDreamTitle = dreamTitle ?? deriveDreamTitle(title);
 
 const canonical = Astro.site && !noindex ? new URL(Astro.url.pathname, Astro.site).href : undefined;
+
+/* 字体预载：分包文件名带内容哈希，写在 font.css 里，要等 CSS 下完才被发现（HTML → CSS → woff2 三跳）。
+   构建期从 scripts/fonts.mjs 的产物里读出两个字重的 0 号核心包（拉丁、全部标点与最常用的字），head 里直接 preload。
+   600 也带上：h1–h3、阅读页题目、主页栏头、目录页卡面的栏名都是 600，几乎每页首屏都有。
+   用不上的页由 fontPreload 收窄（实测：门页一档宋体都不下、标签页只下 600、404 只下 500），免得白下 110–220KB。
+   读不到（还没切出来）就什么都不出，不让构建失败。 */
+let fontCore: string[] = [];
+try {
+  const css = readFileSync('public/fonts/noto-serif-sc/font.css', 'utf8');
+  fontCore = fontPreload.flatMap((w) => css.match(new RegExp(`\\./(${w}-0\\.[0-9a-f]+\\.woff2)`))?.[1] ?? []);
+} catch {
+  /* 没有 font.css：不预载 */
+}
 
 /* 「版块＝时辰」（styles/hours.css）2026-11-04 撤掉：那套色板只兑现了 /tags/ 与 /gate/ 两页，
    而其余版块页早就被 wander（目录页）与 mist（阅读页）接管了底色。
@@ -132,6 +149,11 @@ const canonical = Astro.site && !noindex ? new URL(Astro.url.pathname, Astro.sit
     {noindex && <meta name="robots" content="noindex" />}
     {canonical && <link rel="canonical" href={canonical} />}
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    {
+      fontCore.map((f) => (
+        <link rel="preload" as="font" type="font/woff2" crossorigin href={`/fonts/noto-serif-sc/${f}`} />
+      ))
+    }
     <link rel="stylesheet" href="/fonts/noto-serif-sc/font.css" />
     <link
       rel="alternate"

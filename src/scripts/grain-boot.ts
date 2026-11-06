@@ -30,6 +30,7 @@
    ───────────────────────────────────────────────────────────── */
 
 import { createUiRaster, type UiRaster } from './grain-raster';
+import { loadFontsIn } from './boot';
 
 interface GrainState {
   cellPx: number;
@@ -68,9 +69,10 @@ const RISE0 = 120; // 起始粗格停住的时间
 const RISE1 = 1720; // 收细到 5 屏 px 的时间
 const HAND0 = 1540; // 交接开始：真界面露出来、栅格开始淡出
 const HAND1 = 1762; // 交接结束：栅格没了，字也回到 0 blur
-/* 加载幕：开门条件里「字体到位」最多等这么久（等不到也开门，栅格会在字体到了之后再量一次）；
+/* 加载幕：开门条件里「字体到位」最多等这么久（只等首屏这几行字的字面，两个核心包在 head 里已 preload；
+   等不到也开门，字在字体到了之后才揭，栅格也再量一次）；
    淡出时长与 GrainBoot.astro 里 #boot-load 的 transition 对齐 */
-const FONT_WAIT = 2500;
+const FONT_WAIT = 1200;
 const COVER_FADE = 260;
 
 const BLUR_MAX = 3.0; // 交接起点的真实 blur（≈ 交接时的格宽的一半）
@@ -126,18 +128,16 @@ export function initGrainBoot(): void {
   let time = 0;
   let startAt = 0;
   let raf = 0;
-  /* 字体没到之前先不揭字（流光照常走）；到了再按当前进度显示，避免闪 fallback 字形 */
+  /* 字体没到之前先不揭字（流光照常走）；到了再按当前进度显示，避免闪 fallback 字形。
+     只等首屏这几行字（与 grain-raster.ts 量的是同一批节点）用到的字面，不等整页的 fonts.ready：
+     画卡会把三个集合的全部用字报进字体计划，那要十个分包都落地。这里不设上限，上限只管开门。 */
   let fontsReady = false;
-  document.fonts.ready.then(
-    () => {
+  const fonts = loadFontsIn([title, heads, clock, exits, hint])
+    .catch(() => {})
+    .then(() => {
       fontsReady = true;
       raster?.sync();
-    },
-    () => {
-      fontsReady = true;
-      raster?.sync();
-    },
-  );
+    });
 
   const foot = [clock, exits, hint];
 
@@ -371,7 +371,9 @@ export function initGrainBoot(): void {
     });
   }
 
-  function waitLight(api: WanderBootApi, timeout = 4000): Promise<boolean> {
+  /* 编译在后台跑（KHR_parallel_shader_compile），慢 GPU 上真会编到几秒，
+     上限给足 9s（仍在 head 那道 12s 兜底之内） */
+  function waitLight(api: WanderBootApi, timeout = 9000): Promise<boolean> {
     return new Promise((resolve) => {
       const t0 = performance.now();
       const tick = () => {
@@ -386,17 +388,9 @@ export function initGrainBoot(): void {
     });
   }
 
-  /* 字体到位也是开门条件之一（栅格里的字按真字形量）。等不到也开门——栅格会在字体到了再量一次。 */
+  /* 字体到位也是开门条件之一（栅格里的字按真字形量）。等不到也开门——字体到了才揭字、栅格再量一次。 */
   function waitFonts(timeout = FONT_WAIT): Promise<void> {
-    if (!document.fonts) return Promise.resolve();
-    return new Promise((resolve) => {
-      const t = setTimeout(resolve, timeout);
-      const done = () => {
-        clearTimeout(t);
-        resolve();
-      };
-      document.fonts.ready.then(done, done);
-    });
+    return Promise.race([fonts, new Promise<void>((r) => setTimeout(r, timeout))]);
   }
 
   async function run(): Promise<void> {
@@ -437,8 +431,8 @@ export function initGrainBoot(): void {
     raster?.sync();
     addEventListener('resize', onResize, { passive: true });
 
-    /* 开门：地面（WebGL 流光）编译完 + 字体到位，两样各有上限。编译期间主线程被占住，
-       屏幕停在那层纯色上——这正是它该在的位置。 */
+    /* 开门：地面（WebGL 流光）编译完 + 字体到位，两样各有上限。编译在后台跑、主线程空着，
+       但地面没画出来之前幕一直盖着，屏幕停在那层纯色上——这正是它该在的位置。 */
     api.startLightNow();
     const [lightOk] = await Promise.all([waitLight(api), waitFonts()]);
     if (!lightOk) {

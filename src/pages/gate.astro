@@ -17,7 +17,7 @@ const slices = SLICES.map((s, k) => ({ s, k, p: slicePaths(s) }));
 const VB = `${-VIEW / 2} ${-VIEW / 2} ${VIEW} ${VIEW}`;
 ---
 
-<BaseLayout title="NEXUS — Traveritas" description="通往 NEXUS 的门。" immersive bare bgm="reading">
+<BaseLayout title="NEXUS — Traveritas" description="通往 NEXUS 的门。" immersive bare bgm="reading" fontPreload={[]}>
   <script is:inline>
     if (!matchMedia('(prefers-reduced-motion: reduce)').matches) document.documentElement.classList.add('g-arrive');
   </script>
